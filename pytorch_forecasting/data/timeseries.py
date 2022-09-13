@@ -182,6 +182,7 @@ class TimeSeriesDataSet(Dataset):
         max_encoder_length: int = 30,
         min_encoder_length: int = None,
         min_prediction_idx: int = None,
+        prediction_windows: List[tuple] = [],
         min_prediction_length: int = None,
         max_prediction_length: int = 1,
         static_categoricals: List[str] = [],
@@ -244,6 +245,9 @@ class TimeSeriesDataSet(Dataset):
             min_encoder_length (int): minimum allowed length to encode. Defaults to max_encoder_length.
             min_prediction_idx (int): minimum ``time_idx`` from where to start predictions. This parameter
                 can be useful to create a validation or test set.
+            prediction_windows (List[tuple]): list of tuple with first and last ``time_idx`` defining the time interval 
+                from where to extract predictions. This parameter can be useful to create a validation or test set
+                composed of different time interval.
             max_prediction_length (int): maximum prediction/decoder length (choose this not too short as it can help
                 convergence)
             min_prediction_length (int): minimum prediction/decoder length. Defaults to max_prediction_length
@@ -271,12 +275,12 @@ class TimeSeriesDataSet(Dataset):
                 gaps in the sequence (by default forward fill strategy is used). The values will be only used if
                 ``allow_missing_timesteps=True``. A common use case is to denote that demand was 0 if the sample
                 is not in the dataset.
-            allow_missing_timesteps (bool): if to allow missing timesteps that are automatically filled up. Missing
-                values
-                refer to gaps in the ``time_idx``, e.g. if a specific timeseries has only samples for
+            allow_missing_timesteps (bool, None): if to allow missing timesteps that are automatically filled up.
+                Missing values refer to gaps in the ``time_idx``, e.g. if a specific timeseries has only samples for
                 1, 2, 4, 5, the sample for 3 will be generated on-the-fly.
                 Allow missings does not deal with ``NA`` values. You should fill NA values before
                 passing the dataframe to the TimeSeriesDataSet.
+                If allow_missing_timesteps=None, incomplete sequences will be withdrawn
             lags (Dict[str, List[int]]): dictionary of variable names mapped to list of time steps by
                 which the variable should be lagged.
                 Lags can be useful to indicate seasonality to the models. If you know the seasonalit(ies) of your data,
@@ -370,6 +374,7 @@ class TimeSeriesDataSet(Dataset):
         if min_prediction_idx is None:
             min_prediction_idx = data[self.time_idx].min()
         self.min_prediction_idx = min_prediction_idx
+        self.prediction_windows = prediction_windows
         self.constant_fill_strategy = {} if len(constant_fill_strategy) == 0 else constant_fill_strategy
         self.predict_mode = predict_mode
         self.allow_missing_timesteps = allow_missing_timesteps
@@ -467,6 +472,9 @@ class TimeSeriesDataSet(Dataset):
 
         # filter data
         if min_prediction_idx is not None:
+            assert (
+                    len(self.prediction_windows) == 0
+            ), "the simultaneous use of min_prediction_idx and prediction_windows is not possible"
             # filtering for min_prediction_idx will be done on subsequence level ensuring
             # minimal decoder index is always >= min_prediction_idx
             data = data[lambda x: x[self.time_idx] >= self.min_prediction_idx - self.max_encoder_length - self.max_lag]
@@ -1233,11 +1241,6 @@ class TimeSeriesDataSet(Dataset):
 
         # if there are missing timesteps, we cannot say directly what is the last timestep to include
         # therefore we iterate until it is found
-        if (df_index["time_diff_to_next"] != 1).any():
-            assert (
-                self.allow_missing_timesteps
-            ), "Time difference between steps has been idenfied as larger than 1 - set allow_missing_timesteps=True"
-
         df_index["index_end"], missing_sequences = _find_end_indices(
             diffs=df_index.time_diff_to_next.to_numpy(),
             max_lengths=(max_time - df_index.time).to_numpy() + 1,
@@ -1263,6 +1266,33 @@ class TimeSeriesDataSet(Dataset):
             # prediction must be for after minimal prediction index + length of prediction
             (x["sequence_length"] + x["time"] >= self.min_prediction_idx + self.min_prediction_length)
         ]
+
+        # if prediction windows are given, ensures windows are after min_prediction_idx and filters sequences
+        if self.prediction_windows:
+            assert (
+                all([item >= self.min_prediction_idx for window in self.prediction_windows for item in window])
+            ), "some prediction windows are set before the observed minimum time idx"
+            # for each window, select corresponding data to concat
+            df_index = pd.concat([
+                df_index[
+                    # prediction must be after window start + length of prediction
+                    lambda x: (x["sequence_length"] + x["time"] >= window[0] + self.min_prediction_length)
+                    &
+                    # last prediction must be before or at least at window end
+                    (x["sequence_length"] + x["time"] <= window[1])
+                ]
+                for window in self.prediction_windows], axis=0, ignore_index=True)
+
+        if (df_index["time_diff_to_next"] != 1).any():
+            assert (
+                    self.allow_missing_timesteps is not False
+            ), """Time difference between steps has been identified as larger than 1 
+            - set allow_missing_timesteps=True to interpolate missing timesteps or
+            - set allow_missing_timesteps=None to withdraw missing incomplete sequences"""
+
+        if self.allow_missing_timesteps is None:  # remove incomplete sequences form sampled elements
+            df_index = df_index.loc[df_index.sequence_length == (df_index.index_end + 1 - df_index.index_start)]
+            df_index.reset_index(drop=True, inplace=True)
 
         if predict_mode:  # keep longest element per series (i.e. the first element that spans to the end of the series)
             # filter all elements that are longer than the allowed maximum sequence length
@@ -1451,19 +1481,43 @@ class TimeSeriesDataSet(Dataset):
             Union[int, pd.Series, np.ndarray]: decoder length(s)
         """
         if isinstance(time_last, int):
-            decoder_length = min(
-                time_last - (self.min_prediction_idx - 1),  # not going beyond min prediction idx
-                self.max_prediction_length,  # maximum prediction length
-                sequence_length - self.min_encoder_length,  # sequence length - min decoder length
-            )
+            # determine prediction/decode length and encode length
+            if self.prediction_windows:
+                related_window = [window for window in self.prediction_windows
+                                  if time_last in range(window[0], window[1] + 1)]
+                assert len(related_window) == 1
+                decoder_length = min(  # decoder length cannot be larger than
+                    time_last - (related_window[0][0] - 1),  # interval from window start to last sequence step
+                    self.max_prediction_length,  # maximum prediction length
+                    sequence_length - self.min_encoder_length,  # maximum decoding step once minimum encoder is deduced
+                )
+            else:
+                decoder_length = min(
+                    time_last - (self.min_prediction_idx - 1),  # not going beyond min prediction idx
+                    self.max_prediction_length,  # maximum prediction length
+                    sequence_length - self.min_encoder_length,  # sequence length - min decoder length
+                )
         else:
-            decoder_length = np.min(
-                [
-                    time_last - (self.min_prediction_idx - 1),
-                    sequence_length - self.min_encoder_length,
-                ],
-                axis=0,
-            ).clip(max=self.max_prediction_length)
+            if self.prediction_windows:
+                related_window = [[window for window in self.prediction_windows
+                                   if time_l in range(window[0], window[1] + 1)] for time_l in time_last]
+                assert all(len(window_per_time) == 1 for window_per_time in related_window)
+                related_window_start = pd.Series([window_per_time[0][0] for window_per_time in related_window])
+                decoder_length = np.min(
+                    [
+                        time_last - (related_window_start - 1),
+                        sequence_length - self.min_encoder_length,
+                        ],
+                    axis=0,
+                ).clip(max=self.max_prediction_length)
+            else:
+                decoder_length = np.min(
+                    [
+                        time_last - (self.min_prediction_idx - 1),
+                        sequence_length - self.min_encoder_length,
+                    ],
+                    axis=0,
+                ).clip(max=self.max_prediction_length)
         return decoder_length
 
     def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
