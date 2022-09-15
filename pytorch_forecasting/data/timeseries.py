@@ -182,7 +182,6 @@ class TimeSeriesDataSet(Dataset):
         max_encoder_length: int = 30,
         min_encoder_length: int = None,
         min_prediction_idx: int = None,
-        prediction_windows: List[tuple] = [],
         min_prediction_length: int = None,
         max_prediction_length: int = 1,
         static_categoricals: List[str] = [],
@@ -203,6 +202,7 @@ class TimeSeriesDataSet(Dataset):
         scalers: Dict[str, Union[StandardScaler, RobustScaler, TorchNormalizer, EncoderNormalizer]] = {},
         randomize_length: Union[None, Tuple[float, float], bool] = False,
         predict_mode: bool = False,
+        prediction_windows: List[tuple] = [],
     ):
         """
         Timeseries dataset holding data for models.
@@ -245,9 +245,6 @@ class TimeSeriesDataSet(Dataset):
             min_encoder_length (int): minimum allowed length to encode. Defaults to max_encoder_length.
             min_prediction_idx (int): minimum ``time_idx`` from where to start predictions. This parameter
                 can be useful to create a validation or test set.
-            prediction_windows (List[tuple]): list of tuple with first and last ``time_idx`` defining the time interval 
-                from where to extract predictions. This parameter can be useful to create a validation or test set
-                composed of different time interval.
             max_prediction_length (int): maximum prediction/decoder length (choose this not too short as it can help
                 convergence)
             min_prediction_length (int): minimum prediction/decoder length. Defaults to max_prediction_length
@@ -330,6 +327,9 @@ class TimeSeriesDataSet(Dataset):
                 Effectively, this will take choose for each time series identified by ``group_ids``
                 the last ``max_prediction_length`` samples of each time series as
                 prediction samples and everthing previous up to ``max_encoder_length`` samples as encoder samples.
+            prediction_windows (List[tuple]): list of tuple with first and last ``time_idx`` defining the time interval 
+                from where to extract predictions. This parameter can be useful to create a validation or test set
+                composed of different time interval.
         """
         super().__init__()
         self.max_encoder_length = max_encoder_length
